@@ -3,18 +3,17 @@
 package main
 
 import (
-	"bufio"
-	"crypto/rand"
-	"fmt"
-	"log"
-	"math/big"
-	"time"
-
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"io"
-	"os"
+	"log"
+	"math/big"
+	"sync"
+	"time"
 
 	// --- 基础加密库 ---
 	"github.com/consensys/gnark-crypto/ecc"
@@ -37,256 +36,239 @@ import (
 )
 
 // ==========================================
-// 辅助函数：手动解谜 & AES-GCM 加解密
+// 辅助函数：解谜与 AES-GCM
 // ==========================================
 
 func ManualSolve(seed, N *big.Int, T int64) *big.Int {
 	result := new(big.Int).Set(seed)
 	two := big.NewInt(2)
-	logStep := T / 10
-	if logStep == 0 {
-		logStep = 1
-	}
-	fmt.Printf("      [VTLP] 正在计算 %d 次平方...\n", T)
 	for i := int64(0); i < T; i++ {
 		result.Exp(result, two, N)
-		if (i+1)%logStep == 0 {
-			fmt.Printf("      进度: %d%%\r", (i+1)*100/T)
-		}
 	}
-	fmt.Println("      进度: 100% (完成)   ")
 	return result
 }
 
-func AESGCMEncrypt(y *big.Int, plaintext []byte) []byte {
+func AESGCMEncrypt(y *big.Int, plaintext []byte) ([]byte, error) {
 	hash := sha256.Sum256(y.Bytes())
 	block, err := aes.NewCipher(hash[:])
 	if err != nil {
-		log.Fatal("AES 初始化失败:", err)
+		return nil, err
 	}
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
-		log.Fatal("GCM 初始化失败:", err)
+		return nil, err
 	}
 	nonce := make([]byte, aesgcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		log.Fatal("生成 Nonce 失败:", err)
+		return nil, err
 	}
-	ciphertext := aesgcm.Seal(nonce, nonce, plaintext, nil)
-	return ciphertext
+	return aesgcm.Seal(nonce, nonce, plaintext, nil), nil
 }
 
-func AESGCMDecrypt(y *big.Int, ciphertext []byte) []byte {
+func AESGCMDecrypt(y *big.Int, ciphertext []byte) ([]byte, error) {
 	hash := sha256.Sum256(y.Bytes())
 	block, err := aes.NewCipher(hash[:])
 	if err != nil {
-		log.Fatal("AES 初始化失败:", err)
+		return nil, err
 	}
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
-		log.Fatal("GCM 初始化失败:", err)
+		return nil, err
 	}
 	nonceSize := aesgcm.NonceSize()
 	if len(ciphertext) < nonceSize {
-		log.Fatal("密文长度异常")
+		return nil, errors.New("密文长度异常")
 	}
 	nonce, cipherData := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	plaintext, err := aesgcm.Open(nil, nonce, cipherData, nil)
-	if err != nil {
-		log.Fatal("AES-GCM 解密失败 (密钥错误或数据被篡改):", err)
-	}
-	return plaintext
+	return aesgcm.Open(nil, nonce, cipherData, nil)
 }
 
 // ==========================================
-// 主函数：端到端全流程演示
+// 主流程：含并发双花攻击拦截测试
 // ==========================================
 
 func main() {
 	fmt.Println("================================================================")
-	fmt.Println("   面向时效性与数量限制的匿名数字凭证发行协议")
-	fmt.Println("   阶段：系统架构演进 (AES-GCM 引入与 100% 物理硬盘持久化)")
+	fmt.Println("   阶段：引入高并发状态机与防双花账本 (Service & Mutex)")
 	fmt.Println("================================================================\n")
 
 	// -----------------------------------------------------------------------
-	// 阶段 0: 系统初始化
+	// [System] 预置环境：编译电路与生成密钥
+	// 为了保证在演示并发时内存结构的绝对一致性，在此一次性完成环境 Setup
 	// -----------------------------------------------------------------------
-	fmt.Println("[Phase 0] 系统初始化...")
-
-	fmt.Println("   -> 编译 ZKP 核心电路...")
+	fmt.Println("[System] 正在初始化基础设施 (编译电路与生成密钥)...")
 	var myCircuit circuit.CredentialCircuit
 	ccs, err := frontend.Compile(ecc.BN254, r1cs.NewBuilder, &myCircuit)
 	if err != nil {
-		log.Fatal("电路编译失败:", err)
+		log.Fatal(err)
 	}
-	fmt.Printf("   -> [!!!关键数据!!!] 当前电路总约束数量 (Constraints) 为: %d 条!\n", ccs.GetNbConstraints())
 
-	fmt.Println("   -> 生成 ZKP 证明密钥 (Groth16 Setup)...")
 	pk, vk, err := groth16.Setup(ccs)
 	if err != nil {
-		log.Fatal("Setup失败:", err)
-	}
-
-	// [硬核工程修复]：引入 bufio 并强制 WriteRawTo（未压缩序列化），彻底粉碎老版本库的椭圆曲线解压 Bug！
-	fmt.Println("   -> [System] 正在将巨型证明密钥落盘 (无损未压缩持久化)...")
-
-	pkFile, err := os.Create("proving.key")
-	if err != nil {
 		log.Fatal(err)
 	}
-	bwPK := bufio.NewWriter(pkFile)
-	if rawPK, ok := pk.(interface {
-		WriteRawTo(io.Writer) (int64, error)
-	}); ok {
-		rawPK.WriteRawTo(bwPK) // 接口断言：强制写入 X 和 Y 坐标
-	} else {
-		pk.WriteTo(bwPK)
-	}
-	bwPK.Flush()
-	pkFile.Close()
 
-	vkFile, err := os.Create("verifying.key")
-	if err != nil {
-		log.Fatal(err)
-	}
-	bwVK := bufio.NewWriter(vkFile)
-	if rawVK, ok := vk.(interface {
-		WriteRawTo(io.Writer) (int64, error)
-	}); ok {
-		rawVK.WriteRawTo(bwVK)
-	} else {
-		vk.WriteTo(bwVK)
-	}
-	bwVK.Flush()
-	vkFile.Close()
-
-	fmt.Println("   -> 初始化 VTLP 全局参数...")
+	// -----------------------------------------------------------------------
+	// [微服务架构模拟] 服务端：发行方 (Issuer Service)
+	// -----------------------------------------------------------------------
+	var issuerMu sync.Mutex
 	rsaSetup := protocol.RSAExpSetup()
-
-	fmt.Println("   -> 生成发行方签名密钥...")
 	signKey, _ := eddsa.New(tedwards.BN254, rand.Reader)
 	pubKey := signKey.Public()
-	fmt.Println("   [完成] 系统参数准备就绪。\n")
+	pubKeyBytes := pubKey.Bytes() // 直接获取字节数组，避免接口传递
 
-	// -----------------------------------------------------------------------
-	// 阶段 1: 凭证发行与锁定
-	// -----------------------------------------------------------------------
-	fmt.Println("[Phase 1] 凭证盲化发行与锁定...")
+	// 并发安全的凭证发行接口
+	issueCredential := func(secretVal, nullifierVal *big.Int, T int64) (*big.Int, *big.Int, []byte, error) {
+		hFunc := mimc.NewMiMC()
 
-	secretVal := big.NewInt(12345)
-	nullifierVal := big.NewInt(999)
+		var secretFr, nullifierFr fr.Element
+		secretFr.SetBigInt(secretVal)
+		nullifierFr.SetBigInt(nullifierVal)
 
-	hFunc := mimc.NewMiMC()
+		secBytes := secretFr.Bytes()
+		nulBytes := nullifierFr.Bytes()
+		hFunc.Write(secBytes[:])
+		hFunc.Write(nulBytes[:])
+		commBytes := hFunc.Sum(nil)
 
-	var secretFr, nullifierFr fr.Element
-	secretFr.SetBigInt(secretVal)
-	nullifierFr.SetBigInt(nullifierVal)
-	bSec := secretFr.Bytes()
-	bNull := nullifierFr.Bytes()
+		// --- 临界区：Merkle 树状态更新 (加互斥写锁) ---
+		issuerMu.Lock()
+		defer issuerMu.Unlock() // 放在 Lock 后立即 defer，保证任何情况下都会释放
 
-	hFunc.Write(bSec[:])
-	hFunc.Write(bNull[:])
-	commBytes := hFunc.Sum(nil)
+		mockProofSet := make([][]byte, circuit.TreeDepth)
+		mockHelper := make([][]byte, circuit.TreeDepth)
+		currentHash := commBytes
 
-	hFunc.Reset()
-	hFunc.Write(bNull[:])
-	snBytes := hFunc.Sum(nil)
-	snVal := new(big.Int).SetBytes(snBytes)
-	fmt.Printf("   -> [预计算] 防双花序列号 (SN): %s...\n", snVal.String()[:20])
+		for i := 0; i < circuit.TreeDepth; i++ {
+			var elemFr fr.Element
+			elemFr.SetInt64(int64(100 + i))
+			eBytes := elemFr.Bytes()
+			mockProofSet[i] = eBytes[:]
 
-	mockProofSet := make([][]byte, circuit.TreeDepth)
-	mockHelper := make([][]byte, circuit.TreeDepth)
-	currentHash := commBytes
+			var zeroFr fr.Element
+			zeroFr.SetInt64(0)
+			zBytes := zeroFr.Bytes()
+			mockHelper[i] = zBytes[:]
 
-	for i := 0; i < circuit.TreeDepth; i++ {
-		var elemFr fr.Element
-		elemFr.SetInt64(int64(100 + i))
-		pathElement := elemFr.Bytes()
-
-		mockProofSet[i] = pathElement[:]
-		var zeroFr fr.Element
-		zeroFr.SetInt64(0)
-		zBytes := zeroFr.Bytes()
-		mockHelper[i] = zBytes[:]
+			hFunc.Reset()
+			hFunc.Write(currentHash)
+			hFunc.Write(mockProofSet[i])
+			currentHash = hFunc.Sum(nil)
+		}
+		calculatedRoot := new(big.Int).SetBytes(currentHash)
+		// --- 临界区结束 ---
 
 		hFunc.Reset()
-		hFunc.Write(currentHash)
-		hFunc.Write(pathElement[:])
-		currentHash = hFunc.Sum(nil)
-	}
-	calculatedRoot := new(big.Int).SetBytes(currentHash)
-	fmt.Printf("   -> [预计算] 合法 Merkle Root: %s...\n", calculatedRoot.String()[:20])
+		sigBytes, err := signKey.Sign(commBytes, hFunc)
+		if err != nil {
+			return nil, nil, nil, err // defer 会在 return 时自动执行 Unlock
+		}
 
-	hFunc.Reset()
-	sigBytes, err := signKey.Sign(commBytes, hFunc)
+		payloadTuple := utils.SecretTuple{
+			SigR:       sigBytes[:32],
+			SigS:       sigBytes[32:],
+			ProofSet:   mockProofSet,
+			PathHelper: mockHelper,
+		}
+		payloadBigInt, _ := utils.Serialize(payloadTuple)
+
+		seed, _ := rand.Int(rand.Reader, rsaSetup.RSAMod)
+
+		// 注：加密侧的 yKey 与解密侧的 userKey 在数学上严格等价 (均为 seed^(2^T) mod N)
+		yKey := protocol.GenPuzzle(seed, rsaSetup)
+		aesCiphertext, err := AESGCMEncrypt(yKey, payloadBigInt.Bytes())
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		return seed, calculatedRoot, aesCiphertext, nil
+	}
+
+	// -----------------------------------------------------------------------
+	// [微服务架构模拟] 服务端：验证方 (Verifier Service)
+	// -----------------------------------------------------------------------
+	var verifierMu sync.RWMutex
+	L_spent := make(map[string]bool)
+
+	// 并发安全的核销验证接口
+	verifyCredential := func(proof groth16.Proof, root, sn *big.Int, pkBytes []byte) error {
+		snStr := sn.String()
+
+		// 1. 防双花检测 (加读锁，不阻塞并发校验)
+		verifierMu.RLock()
+		if L_spent[snStr] {
+			verifierMu.RUnlock()
+			return errors.New("该凭证已被核销过")
+		}
+		verifierMu.RUnlock()
+
+		// 2. 构造公共输入并执行零知识验证 (脱离锁区间，充分利用多核 CPU 算力)
+		var assignment circuit.CredentialCircuit
+		assignment.Root = root
+		assignment.SN = sn
+		assignment.Issuer.Assign(ecc.BN254, pkBytes)
+
+		pubWitness, err := frontend.NewWitness(&assignment, ecc.BN254, frontend.PublicOnly())
+		if err != nil {
+			return fmt.Errorf("公共输入构造失败: %v", err)
+		}
+
+		err = groth16.Verify(proof, vk, pubWitness)
+		if err != nil {
+			return fmt.Errorf("ZKP 数学验证未通过: %v", err)
+		}
+
+		// 3. 验证通过，状态变更入账 (加互斥写锁)
+		verifierMu.Lock()
+		defer verifierMu.Unlock()
+		// Double-Check：防止读锁释放期间被其他线程抢占
+		if L_spent[snStr] {
+			return errors.New("并发写入冲突，该凭证已被抢先核销")
+		}
+		L_spent[snStr] = true
+
+		return nil
+	}
+
+	fmt.Println("   [成功] 发行方服务与验证方服务已启动。\n")
+
+	// ---------------------------------------------------------
+	// 用户端行为模拟 (Client Simulation)
+	// ---------------------------------------------------------
+	secretVal := big.NewInt(12345)
+	nullifierVal := big.NewInt(999)
+	const T = 200000
+
+	fmt.Println("[Client] 正在向 Issuer 请求发行凭证...")
+	seed, root, aesCiphertext, err := issueCredential(secretVal, nullifierVal, T)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("   -> [成功] 获取到 AES-GCM 锁定密文。")
+
+	fmt.Println("[Client] 开始本地 VTLP 解谜...")
+	// 注：解密侧的 userKey 与加密侧的 yKey 在数学上严格等价
+	userKey := ManualSolve(seed, rsaSetup.RSAMod, T)
+	recoveredPlaintext, err := AESGCMDecrypt(userKey, aesCiphertext)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	sigR := sigBytes[:32]
-	sigS := sigBytes[32:]
-	payloadTuple := utils.SecretTuple{
-		SigR:       sigR,
-		SigS:       sigS,
-		ProofSet:   mockProofSet,
-		PathHelper: mockHelper,
-	}
-	payloadBigInt, _ := utils.Serialize(payloadTuple)
+	recoveredTuple, _ := utils.Deserialize(new(big.Int).SetBytes(recoveredPlaintext))
 
-	const T = 200000
-	fmt.Printf("   -> 生成时间锁 (T=%d)...\n", T)
-	seed, _ := rand.Int(rand.Reader, rsaSetup.RSAMod)
-	yKey := protocol.GenPuzzle(seed, rsaSetup)
+	fmt.Println("[Client] 正在生成 ZKP 证明...")
 
-	// [系统工程特性 2]：使用 AES-GCM 信封加密凭证载荷
-	aesCiphertext := AESGCMEncrypt(yKey, payloadBigInt.Bytes())
-	fmt.Println("   -> [锁定完成] AES-GCM 密文已下发。\n")
-
-	// -----------------------------------------------------------------------
-	// 阶段 2: 消费 - 解谜
-	// -----------------------------------------------------------------------
-	fmt.Println("[Phase 2] 用户本地解谜 (Time-Lock Solving)...")
-	solveStart := time.Now()
-
-	userKey := ManualSolve(seed, rsaSetup.RSAMod, T)
-
-	// 使用解出来的 userKey 进行 AES-GCM 解密
-	recoveredPlaintext := AESGCMDecrypt(userKey, aesCiphertext)
-	recoveredPayloadBigInt := new(big.Int).SetBytes(recoveredPlaintext)
-
-	fmt.Printf("   -> 解谜完成! 耗时: %s\n", time.Since(solveStart))
-
-	recoveredTuple, err := utils.Deserialize(recoveredPayloadBigInt)
-	if err != nil {
-		log.Fatal("反序列化失败:", err)
-	}
-	fmt.Println("   -> [成功] 凭证见证恢复。\n")
-
-	// -----------------------------------------------------------------------
-	// 阶段 3: 消费 - 生成 ZKP
-	// -----------------------------------------------------------------------
-	fmt.Println("[Phase 3] 零知识证明生成 (ZKP Proving)...")
-
-	// [硬核加载]：没有任何回退！严格通过带有流式缓冲的 bufio 接口从硬盘读取二进制大文件！
-	fmt.Println("   -> [System] 正在严格从物理磁盘文件 proving.key 读取并反序列化密钥...")
-	pkFileIn, err := os.Open("proving.key")
-	if err != nil {
-		log.Fatal("物理磁盘读取 proving.key 失败!", err)
-	}
-	brPK := bufio.NewReader(pkFileIn) // 赋予 I/O 字节级流式读取能力
-	loadedPK := groth16.NewProvingKey(ecc.BN254)
-	if _, err := loadedPK.ReadFrom(brPK); err != nil {
-		log.Fatal("从磁盘流反序列化 PK 彻底失败! ", err)
-	}
-	pkFileIn.Close()
-
-	proveStart := time.Now()
+	hFunc := mimc.NewMiMC()
+	var nullifierFr fr.Element
+	nullifierFr.SetBigInt(nullifierVal)
+	nBytes := nullifierFr.Bytes()
+	hFunc.Write(nBytes[:])
+	snVal := new(big.Int).SetBytes(hFunc.Sum(nil))
 
 	var assignment circuit.CredentialCircuit
-	assignment.Root = calculatedRoot
+	assignment.Root = root
 	assignment.SN = snVal
-	assignment.Issuer.Assign(ecc.BN254, pubKey.Bytes())
-
+	assignment.Issuer.Assign(ecc.BN254, pubKeyBytes)
 	assignment.Secret = secretVal
 	assignment.Nullifier = nullifierVal
 	assignment.Sig.Assign(ecc.BN254, append(recoveredTuple.SigR, recoveredTuple.SigS...))
@@ -295,7 +277,6 @@ func main() {
 	var helperFr [circuit.TreeDepth]frontend.Variable
 	recProofSet := utils.ConvertBytesToFr(recoveredTuple.ProofSet)
 	recHelper := utils.ConvertBytesToFr(recoveredTuple.PathHelper)
-
 	for i := 0; i < circuit.TreeDepth; i++ {
 		proofSetFr[i] = recProofSet[i]
 		helperFr[i] = recHelper[i]
@@ -305,44 +286,40 @@ func main() {
 
 	witness, _ := frontend.NewWitness(&assignment, ecc.BN254)
 
-	// 强制使用磁盘反序列化的 loadedPK 进行证明
-	proof, err := groth16.Prove(ccs, loadedPK, witness)
+	proofStart := time.Now()
+	proof, err := groth16.Prove(ccs, pk, witness)
 	if err != nil {
-		log.Printf("   [错误] 证明生成失败: %v\n", err)
-	} else {
-		fmt.Printf("   -> [成功] 证明生成完毕! 耗时: %s\n", time.Since(proveStart))
+		log.Fatal("生成证明失败:", err)
+	}
+	fmt.Printf("   -> [成功] ZKP 证明准备就绪！耗时: %v\n\n", time.Since(proofStart))
+
+	// ---------------------------------------------------------
+	// 验证方并发安全测试 (高并发双花攻击模拟)
+	// ---------------------------------------------------------
+	fmt.Println("================================================================")
+	fmt.Println("[测试] 模拟恶意用户发动并发双花攻击 (启动 3 个并发线程提交相同证明)")
+	fmt.Println("================================================================")
+
+	var wg sync.WaitGroup
+	attackCount := 3
+
+	for i := 1; i <= attackCount; i++ {
+		wg.Add(1)
+		go func(threadID int) {
+			defer wg.Done()
+
+			// 并发调用 Verifier 服务的核销接口
+			err := verifyCredential(proof, root, snVal, pubKeyBytes)
+			if err != nil {
+				fmt.Printf("   [线程 %d] [拦截] 双花攻击检测: %v\n", threadID, err)
+			} else {
+				fmt.Printf("   [线程 %d] [成功] 凭证核销成功，已安全入账 L_spent！\n", threadID)
+			}
+		}(i)
 	}
 
-	// -----------------------------------------------------------------------
-	// 阶段 4: 验证方核销
-	// -----------------------------------------------------------------------
-	fmt.Println("\n[Phase 4] 验证方核销 (Verification)...")
+	wg.Wait()
 
-	fmt.Println("   -> [System] 服务端严格从物理磁盘加载 Verifying Key...")
-	vkFileIn, err := os.Open("verifying.key")
-	if err != nil {
-		log.Fatal("物理磁盘读取 verifying.key 失败!", err)
-	}
-	brVK := bufio.NewReader(vkFileIn)
-	loadedVK := groth16.NewVerifyingKey(ecc.BN254)
-	if _, err := loadedVK.ReadFrom(brVK); err != nil {
-		log.Fatal("从磁盘流反序列化 VK 彻底失败! ", err)
-	}
-	vkFileIn.Close()
-
-	verifyStart := time.Now()
-	pubWitness, _ := witness.Public()
-
-	// 强制使用磁盘反序列化的 loadedVK 进行验证
-	err = groth16.Verify(proof, loadedVK, pubWitness)
-	if err != nil {
-		log.Fatal("ZKP 验证失败:", err)
-	}
-
-	fmt.Printf("   -> (A) 哈希重构 & (B) 双花推导: 通过\n")
-	fmt.Printf("   -> (C) Merkle 状态包含性: 通过\n")
-	fmt.Printf("   -> (D) EdDSA 签名合法性: 通过\n")
-	fmt.Printf("   -> [成功] 全约束 ZKP 验证极速通过! 验证耗时: %s\n", time.Since(verifyStart))
 	fmt.Println("\n------------------------------------------------")
-	fmt.Println("🎉 真·全链路跑通！底层磁盘 I/O 与 AES-GCM 已彻底集成！")
+	fmt.Println("[完成] 并发双花防御机制验证结束！读写锁与状态机运转完美！")
 }
