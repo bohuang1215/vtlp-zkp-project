@@ -3,15 +3,20 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
+	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -84,43 +89,129 @@ func AESGCMDecrypt(y *big.Int, ciphertext []byte) ([]byte, error) {
 }
 
 // ==========================================
-// 主流程：含并发双花攻击拦截测试
+// HTTP JSON 数据结构定义 (采纳最优实践)
+// ==========================================
+
+type IssueReq struct {
+	Secret    string `json:"secret"`    // Hex String
+	Nullifier string `json:"nullifier"` // Hex String
+	T         int64  `json:"t"`
+}
+
+type IssueResp struct {
+	Seed    string `json:"seed"`     // Hex String
+	Root    string `json:"root"`     // Hex String
+	Cipher  []byte `json:"cipher"`   // 原生 []byte，Go 自动编解码 Base64
+	VtlpSig []byte `json:"vtlp_sig"` // 原生 []byte，Go 自动编解码 Base64
+}
+
+type VerifyReq struct {
+	ProofData []byte `json:"proof_data"` // 序列化后的 Proof 字节流 (自动 Base64)
+	Root      string `json:"root"`       // Hex String
+	SN        string `json:"sn"`         // Hex String
+	PubKey    []byte `json:"pub_key"`    // 发行方公钥字节流 (自动 Base64)
+}
+
+type VerifyResp struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+// ==========================================
+// 主流程
 // ==========================================
 
 func main() {
 	fmt.Println("================================================================")
-	fmt.Println("   阶段：引入高并发状态机与防双花账本 (Service & Mutex)")
+	fmt.Println("   阶段：网络层解耦与 C/S 架构分离 (HTTP/JSON 最终版)")
 	fmt.Println("================================================================\n")
 
 	// -----------------------------------------------------------------------
-	// [System] 预置环境：编译电路与生成密钥
-	// 为了保证在演示并发时内存结构的绝对一致性，在此一次性完成环境 Setup
+	// [System] 预置环境：编译电路并强制同步生成密钥
 	// -----------------------------------------------------------------------
-	fmt.Println("[System] 正在初始化基础设施 (编译电路与生成密钥)...")
+	fmt.Println("[System] 正在编译电路并同步生成 ZKP 证明密钥...")
 	var myCircuit circuit.CredentialCircuit
 	ccs, err := frontend.Compile(ecc.BN254, r1cs.NewBuilder, &myCircuit)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("电路编译失败: %v", err)
 	}
 
 	pk, vk, err := groth16.Setup(ccs)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Setup失败: %v", err)
 	}
 
+	fmt.Println("[System] 正在安全落盘密钥以确保上下文严格一致...")
+	pkFile, _ := os.Create("proving.key")
+	bwPK := bufio.NewWriter(pkFile)
+	if rawPK, ok := pk.(interface {
+		WriteRawTo(io.Writer) (int64, error)
+	}); ok {
+		rawPK.WriteRawTo(bwPK)
+	} else {
+		pk.WriteTo(bwPK)
+	}
+	bwPK.Flush()
+	pkFile.Close()
+
+	vkFile, _ := os.Create("verifying.key")
+	bwVK := bufio.NewWriter(vkFile)
+	if rawVK, ok := vk.(interface {
+		WriteRawTo(io.Writer) (int64, error)
+	}); ok {
+		rawVK.WriteRawTo(bwVK)
+	} else {
+		vk.WriteTo(bwVK)
+	}
+	bwVK.Flush()
+	vkFile.Close()
+
+	fmt.Println("[System] 正在严格从物理磁盘文件读取密钥...")
+	pkFileIn, err := os.Open("proving.key")
+	if err != nil {
+		log.Fatalf("打开 proving.key 失败: %v", err)
+	}
+	brPK := bufio.NewReader(pkFileIn)
+	loadedPK := groth16.NewProvingKey(ecc.BN254)
+	if _, err := loadedPK.ReadFrom(brPK); err != nil {
+		log.Fatalf("反序列化 PK 失败: %v", err)
+	}
+	pkFileIn.Close()
+
+	vkFileIn, err := os.Open("verifying.key")
+	if err != nil {
+		log.Fatalf("打开 verifying.key 失败: %v", err)
+	}
+	brVK := bufio.NewReader(vkFileIn)
+	loadedVK := groth16.NewVerifyingKey(ecc.BN254)
+	if _, err := loadedVK.ReadFrom(brVK); err != nil {
+		log.Fatalf("反序列化 VK 失败: %v", err)
+	}
+	vkFileIn.Close()
+
 	// -----------------------------------------------------------------------
-	// [微服务架构模拟] 服务端：发行方 (Issuer Service)
+	// [服务端] 启动 HTTP Web Server
 	// -----------------------------------------------------------------------
 	var issuerMu sync.Mutex
 	rsaSetup := protocol.RSAExpSetup()
 	signKey, _ := eddsa.New(tedwards.BN254, rand.Reader)
-	pubKey := signKey.Public()
-	pubKeyBytes := pubKey.Bytes() // 直接获取字节数组，避免接口传递
+	pubKeyBytes := signKey.Public().Bytes()
 
-	// 并发安全的凭证发行接口
-	issueCredential := func(secretVal, nullifierVal *big.Int, T int64) (*big.Int, *big.Int, []byte, error) {
+	var verifierMu sync.RWMutex
+	L_spent := make(map[string]bool)
+
+	// API 1: 发行接口
+	http.HandleFunc("/api/v1/issue", func(w http.ResponseWriter, r *http.Request) {
+		var req IssueReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "JSON 解析失败", http.StatusBadRequest)
+			return
+		}
+
+		secretVal, _ := new(big.Int).SetString(req.Secret, 16)
+		nullifierVal, _ := new(big.Int).SetString(req.Nullifier, 16)
+
 		hFunc := mimc.NewMiMC()
-
 		var secretFr, nullifierFr fr.Element
 		secretFr.SetBigInt(secretVal)
 		nullifierFr.SetBigInt(nullifierVal)
@@ -131,9 +222,8 @@ func main() {
 		hFunc.Write(nulBytes[:])
 		commBytes := hFunc.Sum(nil)
 
-		// --- 临界区：Merkle 树状态更新 (加互斥写锁) ---
 		issuerMu.Lock()
-		defer issuerMu.Unlock() // 放在 Lock 后立即 defer，保证任何情况下都会释放
+		defer issuerMu.Unlock()
 
 		mockProofSet := make([][]byte, circuit.TreeDepth)
 		mockHelper := make([][]byte, circuit.TreeDepth)
@@ -156,13 +246,9 @@ func main() {
 			currentHash = hFunc.Sum(nil)
 		}
 		calculatedRoot := new(big.Int).SetBytes(currentHash)
-		// --- 临界区结束 ---
 
 		hFunc.Reset()
-		sigBytes, err := signKey.Sign(commBytes, hFunc)
-		if err != nil {
-			return nil, nil, nil, err // defer 会在 return 时自动执行 Unlock
-		}
+		sigBytes, _ := signKey.Sign(commBytes, hFunc)
 
 		payloadTuple := utils.SecretTuple{
 			SigR:       sigBytes[:32],
@@ -173,91 +259,123 @@ func main() {
 		payloadBigInt, _ := utils.Serialize(payloadTuple)
 
 		seed, _ := rand.Int(rand.Reader, rsaSetup.RSAMod)
-
-		// 注：加密侧的 yKey 与解密侧的 userKey 在数学上严格等价 (均为 seed^(2^T) mod N)
 		yKey := protocol.GenPuzzle(seed, rsaSetup)
-		aesCiphertext, err := AESGCMEncrypt(yKey, payloadBigInt.Bytes())
-		if err != nil {
-			return nil, nil, nil, err
+		aesCiphertext, _ := AESGCMEncrypt(yKey, payloadBigInt.Bytes())
+
+		// [架构修复] pi_vtlp 真实语义：对 (seed || aesCiphertext) 进行原子绑定背书签名
+		msgToSign := append(seed.Bytes(), aesCiphertext...)
+		hFunc.Reset()
+		vtlpSigBytes, _ := signKey.Sign(msgToSign, hFunc)
+
+		resp := IssueResp{
+			Seed:    seed.Text(16),
+			Root:    calculatedRoot.Text(16),
+			Cipher:  aesCiphertext,
+			VtlpSig: vtlpSigBytes,
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// API 2: 核销接口
+	http.HandleFunc("/api/v1/verify", func(w http.ResponseWriter, r *http.Request) {
+		var req VerifyReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "JSON 解析失败", http.StatusBadRequest)
+			return
 		}
 
-		return seed, calculatedRoot, aesCiphertext, nil
-	}
+		snVal, _ := new(big.Int).SetString(req.SN, 16)
+		rootVal, _ := new(big.Int).SetString(req.Root, 16)
+		snStr := snVal.String()
 
-	// -----------------------------------------------------------------------
-	// [微服务架构模拟] 服务端：验证方 (Verifier Service)
-	// -----------------------------------------------------------------------
-	var verifierMu sync.RWMutex
-	L_spent := make(map[string]bool)
-
-	// 并发安全的核销验证接口
-	verifyCredential := func(proof groth16.Proof, root, sn *big.Int, pkBytes []byte) error {
-		snStr := sn.String()
-
-		// 1. 防双花检测 (加读锁，不阻塞并发校验)
 		verifierMu.RLock()
 		if L_spent[snStr] {
 			verifierMu.RUnlock()
-			return errors.New("该凭证已被核销过")
+			http.Error(w, "双花攻击检测: 该凭证已被核销过", http.StatusConflict)
+			return
 		}
 		verifierMu.RUnlock()
 
-		// 2. 构造公共输入并执行零知识验证 (脱离锁区间，充分利用多核 CPU 算力)
+		proof := groth16.NewProof(ecc.BN254)
+		if _, err := proof.ReadFrom(bytes.NewReader(req.ProofData)); err != nil {
+			http.Error(w, "Proof 反序列化失败", http.StatusBadRequest)
+			return
+		}
+
 		var assignment circuit.CredentialCircuit
-		assignment.Root = root
-		assignment.SN = sn
-		assignment.Issuer.Assign(ecc.BN254, pkBytes)
+		assignment.Root = rootVal
+		assignment.SN = snVal
+		assignment.Issuer.Assign(ecc.BN254, req.PubKey)
 
-		pubWitness, err := frontend.NewWitness(&assignment, ecc.BN254, frontend.PublicOnly())
-		if err != nil {
-			return fmt.Errorf("公共输入构造失败: %v", err)
+		pubWitness, _ := frontend.NewWitness(&assignment, ecc.BN254, frontend.PublicOnly())
+		if err := groth16.Verify(proof, loadedVK, pubWitness); err != nil {
+			http.Error(w, "ZKP 数学验证未通过", http.StatusForbidden)
+			return
 		}
 
-		err = groth16.Verify(proof, vk, pubWitness)
-		if err != nil {
-			return fmt.Errorf("ZKP 数学验证未通过: %v", err)
-		}
-
-		// 3. 验证通过，状态变更入账 (加互斥写锁)
 		verifierMu.Lock()
 		defer verifierMu.Unlock()
-		// Double-Check：防止读锁释放期间被其他线程抢占
 		if L_spent[snStr] {
-			return errors.New("并发写入冲突，该凭证已被抢先核销")
+			http.Error(w, "并发写入冲突，该凭证已被抢先核销", http.StatusConflict)
+			return
 		}
 		L_spent[snStr] = true
 
-		return nil
-	}
+		json.NewEncoder(w).Encode(VerifyResp{Status: "success", Message: "凭证核销入账成功"})
+	})
 
-	fmt.Println("   [成功] 发行方服务与验证方服务已启动。\n")
+	go func() {
+		fmt.Println("[Server] 服务端监听在 http://127.0.0.1:8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Fatalf("HTTP 服务启动失败: %v", err)
+		}
+	}()
+	time.Sleep(200 * time.Millisecond) // 等待服务器启动
 
-	// ---------------------------------------------------------
-	// 用户端行为模拟 (Client Simulation)
-	// ---------------------------------------------------------
+	// -----------------------------------------------------------------------
+	// [客户端] HTTP 请求交互与本地验证
+	// -----------------------------------------------------------------------
+	fmt.Println("\n[Client] 构造 JSON 载荷，通过 HTTP POST 请求发行凭证...")
 	secretVal := big.NewInt(12345)
 	nullifierVal := big.NewInt(999)
 	const T = 200000
 
-	fmt.Println("[Client] 正在向 Issuer 请求发行凭证...")
-	seed, root, aesCiphertext, err := issueCredential(secretVal, nullifierVal, T)
+	issueReqBody, _ := json.Marshal(IssueReq{
+		Secret:    secretVal.Text(16),
+		Nullifier: nullifierVal.Text(16),
+		T:         T,
+	})
+
+	resp, err := http.Post("http://127.0.0.1:8080/api/v1/issue", "application/json", bytes.NewBuffer(issueReqBody))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("HTTP 请求失败: %v", err)
 	}
-	fmt.Println("   -> [成功] 获取到 AES-GCM 锁定密文。")
+
+	var issueResp IssueResp
+	json.NewDecoder(resp.Body).Decode(&issueResp)
+	resp.Body.Close()
+	fmt.Println("   -> [成功] 收到服务端的 HTTP 响应 (包含 AES-GCM 密文与 pi_vtlp)。")
+
+	seed, _ := new(big.Int).SetString(issueResp.Seed, 16)
+	root, _ := new(big.Int).SetString(issueResp.Root, 16)
+
+	fmt.Println("[Client] 正在执行 Check-Before-You-Solve (验证密文来源合法性)...")
+	msgToVerify := append(seed.Bytes(), issueResp.Cipher...)
+
+	// 客户端使用发行方公钥验证密文背书 (拦截算力枯竭攻击)
+	verifyHashFunc := mimc.NewMiMC()
+	isValid, _ := signKey.Public().Verify(issueResp.VtlpSig, msgToVerify, verifyHashFunc)
+	if !isValid {
+		log.Fatalf("预验证拦截: 密文被篡改或来源不合法，拒绝执行耗时解谜！")
+	}
+	fmt.Println("   -> [成功] pi_vtlp 预验证通过，密文可信。")
 
 	fmt.Println("[Client] 开始本地 VTLP 解谜...")
-	// 注：解密侧的 userKey 与加密侧的 yKey 在数学上严格等价
 	userKey := ManualSolve(seed, rsaSetup.RSAMod, T)
-	recoveredPlaintext, err := AESGCMDecrypt(userKey, aesCiphertext)
-	if err != nil {
-		log.Fatal(err)
-	}
-
+	recoveredPlaintext, _ := AESGCMDecrypt(userKey, issueResp.Cipher)
 	recoveredTuple, _ := utils.Deserialize(new(big.Int).SetBytes(recoveredPlaintext))
 
-	fmt.Println("[Client] 正在生成 ZKP 证明...")
-
+	fmt.Println("[Client] 正在生成 ZKP 证明，并序列化写入字节缓冲流...")
 	hFunc := mimc.NewMiMC()
 	var nullifierFr fr.Element
 	nullifierFr.SetBigInt(nullifierVal)
@@ -285,20 +403,26 @@ func main() {
 	assignment.PathIndices = helperFr
 
 	witness, _ := frontend.NewWitness(&assignment, ecc.BN254)
+	proof, _ := groth16.Prove(ccs, loadedPK, witness)
 
-	proofStart := time.Now()
-	proof, err := groth16.Prove(ccs, pk, witness)
-	if err != nil {
-		log.Fatal("生成证明失败:", err)
-	}
-	fmt.Printf("   -> [成功] ZKP 证明准备就绪！耗时: %v\n\n", time.Since(proofStart))
+	var proofBuf bytes.Buffer
+	proof.WriteTo(&proofBuf) // 将 Proof 写入字节流
 
-	// ---------------------------------------------------------
-	// 验证方并发安全测试 (高并发双花攻击模拟)
-	// ---------------------------------------------------------
+	fmt.Println("   -> [成功] ZKP 证明准备就绪，已转换为 HTTP 传输格式。\n")
+
+	// -----------------------------------------------------------------------
+	// 验证方并发安全测试 (高并发 HTTP POST 模拟)
+	// -----------------------------------------------------------------------
 	fmt.Println("================================================================")
-	fmt.Println("[测试] 模拟恶意用户发动并发双花攻击 (启动 3 个并发线程提交相同证明)")
+	fmt.Println("[测试] 模拟恶意用户并发双花攻击 (通过 HTTP 端口并发提交)")
 	fmt.Println("================================================================")
+
+	verifyReqBody, _ := json.Marshal(VerifyReq{
+		ProofData: proofBuf.Bytes(),
+		Root:      issueResp.Root,
+		SN:        snVal.Text(16),
+		PubKey:    pubKeyBytes,
+	})
 
 	var wg sync.WaitGroup
 	attackCount := 3
@@ -308,18 +432,25 @@ func main() {
 		go func(threadID int) {
 			defer wg.Done()
 
-			// 并发调用 Verifier 服务的核销接口
-			err := verifyCredential(proof, root, snVal, pubKeyBytes)
+			vResp, err := http.Post("http://127.0.0.1:8080/api/v1/verify", "application/json", bytes.NewBuffer(verifyReqBody))
 			if err != nil {
-				fmt.Printf("   [线程 %d] [拦截] 双花攻击检测: %v\n", threadID, err)
+				fmt.Printf("   [HTTP 客户端 %d 错误] %v\n", threadID, err)
+				return
+			}
+			defer vResp.Body.Close()
+
+			if vResp.StatusCode == http.StatusOK {
+				fmt.Printf("   [线程 %d] [核销通过] HTTP 200: 凭证核销成功！\n", threadID)
 			} else {
-				fmt.Printf("   [线程 %d] [成功] 凭证核销成功，已安全入账 L_spent！\n", threadID)
+				bodyBytes, _ := io.ReadAll(vResp.Body)
+				// bodyBytes 结尾自带换行符，所以不需要额外加 \n
+				fmt.Printf("   [线程 %d] [网络拦截] HTTP %d: %s", threadID, vResp.StatusCode, string(bodyBytes))
 			}
 		}(i)
 	}
 
 	wg.Wait()
 
-	fmt.Println("\n------------------------------------------------")
-	fmt.Println("[完成] 并发双花防御机制验证结束！读写锁与状态机运转完美！")
+	fmt.Println("------------------------------------------------")
+	fmt.Println("[完成] 真·微服务架构闭环！网络隔离与 JSON 序列化完美执行！")
 }
